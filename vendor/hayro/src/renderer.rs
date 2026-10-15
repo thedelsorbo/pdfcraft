@@ -629,11 +629,22 @@ impl Renderer {
         pixel_format: ImagePixelFormat,
         interpolate: bool,
     ) -> (Vec<u8>, u32, u32) {
-        // PdfCraft patch (#624): `/Interpolate` governs the pre-minification pass too. Using
+        // PdfCraft patch (#624): `/Interpolate` governs the pre-resize pass too. Using
         // Catmull-Rom here for an image that did not request interpolation blends hard edges
-        // before ImageQuality::Low gets a chance to sample it. Keep the pre-resize (and its
-        // bounded memory/performance behaviour), but use nearest-neighbour when interpolation
-        // is disabled. PDF's default for `/Interpolate` is false.
+        // before ImageQuality::Low gets a chance to sample it, so an enlarged image keeps
+        // nearest-neighbour when interpolation is disabled (PDF's default for `/Interpolate`).
+        //
+        // PdfCraft patch (minified scans): shrinking is different. `/Interpolate` is about
+        // smoothing an image drawn *larger* than its samples (PDF 32000-1 §8.9.6.3); when an
+        // image is drawn smaller, every device pixel covers several samples and dropping all but
+        // one of them aliases: a 300 dpi scan or a screenshot shown at a fraction of its size
+        // gets ragged strokes and uneven stems, the "imprecise text" of scanned cards. Acrobat,
+        // pdf.js, MuPDF and Poppler average the covered samples whatever the flag says. A shrunk
+        // image is therefore filtered (Catmull-Rom, as interpolated images are) whether or not
+        // it asked for interpolation, and only an enlarged one stays nearest. A shrink the
+        // filter cannot plan (a source beyond its side cap) still falls back to nearest.
+        // `interpolate` here is the caller's decision to filter (`draw_image`: `/Interpolate`, or
+        // a shrink the filter can plan); the filtered path needs the scratch and plan bounds.
         let nearest = Scaler::new(ResamplingFunction::Nearest);
         let scaler = if interpolate { &self.scaler } else { &nearest };
         let resized = match pixel_format {
@@ -801,16 +812,31 @@ impl Renderer {
         let has_alpha = alpha_data.is_some();
         let mut may_have_transparency = has_alpha || self.force_images_may_have_transparency();
         let requested_resize = x_scale < 1.0 || y_scale < 1.0;
-        let (new_width, new_height) = match image_resampling_size(
-            source_width,
-            source_height,
-            channels,
-            data_len,
-            x_scale,
-            y_scale,
-            MAX_IMAGE_PIXELS,
-            interpolate,
-        ) {
+        // PdfCraft patch (minified scans): a shrunk image is filtered whatever `/Interpolate`
+        // says (see `resize_image_data`), so it is planned and bounded as an interpolated one;
+        // when the filter cannot plan it, the nearest-neighbour shrink of before stands in.
+        let plan = |filter: bool| {
+            image_resampling_size(
+                source_width,
+                source_height,
+                channels,
+                data_len,
+                x_scale,
+                y_scale,
+                MAX_IMAGE_PIXELS,
+                filter,
+            )
+        };
+        let mut filter = interpolate || requested_resize;
+        let planned = plan(filter).or_else(|| {
+            if filter && !interpolate {
+                filter = false;
+                plan(false)
+            } else {
+                None
+            }
+        });
+        let (new_width, new_height) = match planned {
             Some(target) => target,
             None => {
                 if image_byte_len(source_width, source_height, 4, MAX_IMAGE_PIXELS).is_none() {
@@ -830,12 +856,13 @@ impl Renderer {
         if requested_resize && self.in_type3_glyph && interpolate {
             quality = ImageQuality::High;
         }
-        // PdfCraft patch: an axis-aligned, interpolated image that is shrunk lands on whole device
-        // pixels. It is shrunk once to exactly its snapped device rectangle and drawn 1:1 at the
-        // snapped corner. Otherwise the shrunk raster (rounded up to a whole size) is sampled a
-        // second time at a fractional scale and offset, which blurs scans and photos.
-        let snapped = if interpolate
-            && requested_resize
+        // PdfCraft patch: an axis-aligned image that is shrunk lands on whole device pixels. It
+        // is shrunk once to exactly its snapped device rectangle and drawn 1:1 at the snapped
+        // corner. Otherwise the shrunk raster (rounded up to a whole size) is sampled a second
+        // time at a fractional scale and offset, which blurs scans and photos. Since shrinking is
+        // filtered whatever `/Interpolate` says (`resize_image_data`), this applies to every
+        // shrunk image, not only interpolated ones.
+        let snapped = if requested_resize
             && !self.in_type3_glyph
             && (new_width, new_height) != (source_width, source_height)
         {
@@ -846,11 +873,11 @@ impl Renderer {
         let (new_width, new_height) = snapped.map_or((new_width, new_height), |s| (s.0, s.1));
         let needs_resize = (new_width, new_height) != (source_width, source_height);
 
-        // PdfCraft patch (#624): a minified image with a soft mask that is not interpolated is
-        // nearest-sampled straight into premultiplied target RGBA. That skips the full-resolution
-        // RGBA copy below and the premultiply pass after it.
+        // PdfCraft patch (#624): a minified image with a soft mask that is shrunk by nearest
+        // neighbour (the filter could not plan it) is sampled straight into premultiplied target
+        // RGBA. That skips the full-resolution RGBA copy below and the premultiply pass after it.
         let direct = match &alpha_data {
-            Some(alpha) if needs_resize && !interpolate => nearest_premultiplied_rgba(
+            Some(alpha) if needs_resize && !filter => nearest_premultiplied_rgba(
                 &image_data,
                 &alpha.data,
                 (source_width, source_height),
@@ -909,7 +936,7 @@ impl Renderer {
                 new_width,
                 new_height,
                 format,
-                interpolate,
+                filter,
             )
         } else {
             (data, source_width, source_height)

@@ -2338,7 +2338,7 @@ mod tests {
     }
 
     /// A source wider than the filter's 2^20-pixel side cap is shrunk by nearest-neighbour rather
-    /// than refused and skipped (the default, `/Interpolate` omitted, is nearest).
+    /// than refused and skipped (the filtered shrink of a minified image falls back to nearest).
     #[test]
     fn wide_non_interpolated_sources_draw_after_shrinking() {
         let data = "7f".repeat(1_100_000);
@@ -4788,29 +4788,38 @@ trailer << /Root 1 0 R >>
         page
     }
 
-    /// Issue #624: an image drawn below its source resolution was pre-resampled with Catmull-Rom
-    /// even when `/Interpolate` was false (or absent, whose PDF default is false). That blends
-    /// neighboring samples before the renderer's later non-interpolating image sampler sees them,
-    /// making scans, screenshots and rasterized text look soft.
+    /// Issue #624 asked for sharp minified scans; the first fix (#635) shrank every image that did
+    /// not ask for `/Interpolate` by nearest neighbour, which drops most of the samples a device
+    /// pixel covers: a 300 dpi scan on a screen gets ragged strokes and stems of uneven weight.
+    /// Shrinking is now filtered whatever `/Interpolate` says, as Acrobat, pdf.js and Poppler do;
+    /// the flag only decides whether an *enlarged* image is smoothed (PDF 32000-1 §8.9.6.3).
     #[test]
-    fn non_interpolated_images_are_not_smoothed_when_minified() {
-        // Top band K W R G, bottom band B Y M C. Nearest 8×4 → 4×2 sampling picks each block's
-        // pixel, so every device pixel is one palette colour; Catmull-Rom blends across blocks.
-        let palette: [[u8; 3]; 8] = [[0, 0, 0], [255, 255, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [255, 0, 255], [0, 255, 255]];
-        let rgb: Vec<u8> = block_source(palette).concat();
-        let exact: Vec<[u8; 4]> = palette.iter().map(|c| [c[0], c[1], c[2], 255]).collect();
-        let pixels = |p: &RenderedPage| p.rgba.as_chunks::<4>().0.to_vec();
-
-        // `/Interpolate` defaults to false, and explicit false is equivalent.
-        let omitted = draw_minified_image("DeviceRGB", (8, 4), None, &rgb, None, (4, 2));
-        assert_eq!(pixels(&omitted), exact, "default interpolation");
-        let disabled = draw_minified_image("DeviceRGB", (8, 4), Some(false), &rgb, None, (4, 2));
-        assert_eq!(&omitted.rgba[..], &disabled.rgba[..], "/Interpolate false must match the default");
-
-        // The fix must not disable interpolation: the same source asking for it blends blocks.
-        let enabled = draw_minified_image("DeviceRGB", (8, 4), Some(true), &rgb, None, (4, 2));
-        assert_ne!(pixels(&enabled), exact, "/Interpolate true should still blend");
-        assert!(pixels(&enabled).iter().any(|px| px[..3].iter().any(|&c| (32..=223).contains(&c))), "/Interpolate true made no mid-tone");
+    fn minified_images_are_filtered_whatever_interpolate_says() {
+        // One-pixel stripes below the device resolution: 8 columns alternating black and white
+        // drawn 4 wide. Nearest keeps one stripe per device pixel (all black or all white);
+        // a filter averages the pair under each device pixel to a mid-grey.
+        let stripes: Vec<u8> = (0..32).map(|i| if i % 2 == 0 { 0 } else { 255 }).collect();
+        let grays = |p: &RenderedPage| -> Vec<u8> { p.rgba.as_chunks::<4>().0.iter().map(|px| px[0]).collect() };
+        for interpolate in [None, Some(false), Some(true)] {
+            let page = draw_minified_image("DeviceGray", (8, 4), interpolate, &stripes, None, (4, 2));
+            for (i, g) in grays(&page).iter().enumerate() {
+                assert!((64..=192).contains(g), "/Interpolate {interpolate:?}: device pixel {i} is {g}, not an average of its stripes");
+            }
+        }
+        // The same stripes with a soft mask take the filtered path too (#624's direct nearest
+        // path is kept only for a shrink the filter cannot plan).
+        let mask = vec![255u8; 32];
+        let page = draw_minified_image("DeviceGray", (8, 4), None, &stripes, Some(&mask), (4, 2));
+        for (i, g) in grays(&page).iter().enumerate() {
+            assert!((64..=192).contains(g), "masked: device pixel {i} is {g}, not an average of its stripes");
+        }
+        // Enlarging is where `/Interpolate` decides: 2×2 blocks drawn 8×8 stay hard-edged
+        // without it and blend with it.
+        let blocks = [0u8, 255, 255, 0];
+        let hard = draw_minified_image("DeviceGray", (2, 2), None, &blocks, None, (8, 8));
+        assert!(grays(&hard).iter().all(|g| *g == 0 || *g == 255), "an enlarged image without /Interpolate must stay nearest-neighbour");
+        let soft = draw_minified_image("DeviceGray", (2, 2), Some(true), &blocks, None, (8, 8));
+        assert!(grays(&soft).iter().any(|g| (32..=223).contains(g)), "/Interpolate true should blend an enlarged image");
     }
 
     /// A shrunk, interpolated image whose edges fall between device pixels is snapped to whole
@@ -4849,34 +4858,47 @@ trailer << /Root 1 0 R >>
     }
 
     #[test]
-    fn non_interpolated_gray_images_are_not_smoothed_when_minified() {
+    fn minified_gray_images_average_the_samples_they_cover() {
+        // Each 2×2 block is a flat level: a filtered 2× shrink returns the block's level (within
+        // the filter's rounding), where nearest would too — but the same must hold when the two
+        // columns of a block differ: their average, not one of them.
         let levels = [0u8, 255, 85, 170, 40, 200, 120, 230];
         let page = draw_minified_image("DeviceGray", (8, 4), None, &block_source(levels), None, (4, 2));
-        let expected: Vec<[u8; 4]> = levels.iter().map(|&v| [v, v, v, 255]).collect();
-        assert_eq!(page.rgba.as_chunks::<4>().0.to_vec(), expected);
+        let grays: Vec<u8> = page.rgba.as_chunks::<4>().0.iter().map(|px| px[0]).collect();
+        // Catmull-Rom's support reaches into the neighbouring blocks, so a block is not exact.
+        for (g, want) in grays.iter().zip(levels) {
+            assert!((i16::from(*g) - i16::from(want)).abs() <= 48, "flat block {want} came out as {g}");
+        }
+        let halves: Vec<u8> = (0..32).map(|i| if i % 2 == 0 { 0 } else { 200 }).collect();
+        let page = draw_minified_image("DeviceGray", (8, 4), None, &halves, None, (4, 2));
+        for px in page.rgba.as_chunks::<4>().0 {
+            assert!((80..=120).contains(&px[0]), "a 0|200 pair should average near 100, got {}", px[0]);
+        }
     }
 
     #[test]
-    fn non_integer_minification_samples_the_same_columns() {
-        // Ten columns drawn six pixels wide: centre sampling reads columns 0, 2, 4, 5, 7 and 9.
+    fn non_integer_minification_keeps_a_ramp_smooth() {
+        // Ten columns drawn six pixels wide: a filtered shrink keeps the ramp monotonic between
+        // its ends, where nearest skipped columns 1, 3, 6 and 8.
         let ramp = [10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100];
         let page = draw_minified_image("DeviceGray", (10, 1), None, &ramp, None, (6, 1));
         let grays: Vec<u8> = page.rgba.as_chunks::<4>().0.iter().map(|px| px[0]).collect();
-        assert_eq!(grays, [10, 30, 50, 60, 80, 100]);
+        assert!(grays.windows(2).all(|w| w[0] < w[1]), "ramp is not monotonic: {grays:?}");
+        assert!(grays[0] <= 25 && grays[5] >= 85, "ramp ends drifted: {grays:?}");
     }
 
     #[test]
-    fn non_integer_minification_samples_colour_and_mask_from_the_same_columns() {
-        // Ten gray columns with a soft mask, drawn six pixels wide: columns 0, 2, 4, 5, 7 and 9 are
-        // sampled, so the mask must pick the same columns as the colours.
+    fn non_integer_minification_filters_colour_and_mask_together() {
+        // Ten gray columns with a soft mask that hides the middle, drawn six pixels wide: the
+        // mask is shrunk with the colours, so the opaque ends keep their gray and the hidden
+        // middle shows the white page, with at most a blended pixel at each edge.
         let ramp = [10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100];
-        let mask = [255u8, 0, 0, 0, 255, 255, 0, 0, 0, 255];
+        let mask = [255u8, 255, 255, 0, 0, 0, 0, 255, 255, 255];
         let page = draw_minified_image("DeviceGray", (10, 1), None, &ramp, Some(&mask), (6, 1));
-        // Opaque columns keep their gray; transparent columns show the white page.
-        assert_eq!(
-            page.rgba.as_chunks::<4>().0.to_vec(),
-            vec![[10, 10, 10, 255], [255, 255, 255, 255], [50, 50, 50, 255], [60, 60, 60, 255], [255, 255, 255, 255], [100, 100, 100, 255]]
-        );
+        let grays: Vec<u8> = page.rgba.as_chunks::<4>().0.iter().map(|px| px[0]).collect();
+        assert!(grays[0] <= 40, "left end should keep its dark gray: {grays:?}");
+        assert!(grays[5] >= 80 && grays[5] <= 110 || grays[5] == 255, "right end: {grays:?}");
+        assert!(grays[2] >= 200 && grays[3] >= 200, "the hidden middle should show the page: {grays:?}");
     }
 
     #[test]
@@ -4885,18 +4907,26 @@ trailer << /Root 1 0 R >>
         let rgb: Vec<u8> = block_source(palette).concat();
         let alpha = block_source([255u8, 0, 128, 255, 0, 255, 64, 128]);
         let page = draw_minified_image("DeviceRGB", (8, 4), None, &rgb, Some(&alpha), (4, 2));
-        // Premultiplied colours composited over the white page: alpha 0 shows the page.
-        let expected = vec![
-            [0, 0, 0, 255],
-            [255, 255, 255, 255],
-            [255, 127, 127, 255],
-            [0, 255, 0, 255],
-            [255, 255, 255, 255],
-            [255, 255, 0, 255],
-            [255, 191, 255, 255],
-            [127, 255, 255, 255],
+        // Premultiplied colours composited over the white page: alpha 0 shows the page. The
+        // shrink is filtered (colours and mask together), so each block is near, not exactly,
+        // its own colour: Catmull-Rom's support reaches into the neighbouring blocks.
+        let expected: [[u8; 3]; 8] = [
+            [0, 0, 0],
+            [255, 255, 255],
+            [255, 127, 127],
+            [0, 255, 0],
+            [255, 255, 255],
+            [255, 255, 0],
+            [255, 191, 255],
+            [127, 255, 255],
         ];
-        assert_eq!(page.rgba.as_chunks::<4>().0.to_vec(), expected);
+        for (px, want) in page.rgba.as_chunks::<4>().0.iter().zip(expected) {
+            assert_eq!(px[3], 255, "composited over the page");
+            for c in 0..3 {
+                // Saturated 2×2 blocks of differing alpha are the filter's worst case for bleed.
+                assert!((i16::from(px[c]) - i16::from(want[c])).abs() <= 64, "block {want:?} came out as {px:?}");
+            }
+        }
     }
 
     /// Issue #1649: Word can save text as a tiny black image whose `/SMask` is a high-resolution
@@ -4930,13 +4960,11 @@ trailer << /Root 1 0 R >>
         assert_eq!(grays[3], 255, "{grays:?}");
     }
 
-    /// Type 3 glyph images used to be sampled bicubically (`ImageQuality::High`) whatever their
-    /// `/Interpolate`, which blends the nearest pre-resize back in. The glyph is 4.6 × 2.3 pixels
-    /// and its image pre-resizes to 5 × 3, so the final draw samples fractionally and bicubic
-    /// filtering would blend palette colours. Interior pixels must stay palette colours unless the
-    /// image asks for interpolation.
+    /// A Type 3 glyph image drawn below its resolution (the glyph is 4.6 × 2.3 pixels, its image
+    /// 8 × 4) is shrunk through the filter whether or not it asks for `/Interpolate`, as every
+    /// shrunk image is: bitmap fonts on screen average their samples instead of dropping them.
     #[test]
-    fn non_interpolated_type3_glyph_images_are_not_smoothed_when_minified() {
+    fn shrunk_type3_glyph_images_are_filtered_whatever_interpolate_says() {
         let palette: [[u8; 3]; 8] = [[0, 0, 0], [255, 255, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [255, 0, 255], [0, 255, 255]];
         let data = hex(&block_source(palette).concat());
         let render = |interp: &str| {
@@ -4966,10 +4994,10 @@ trailer << /Root 1 0 R >>
             (0..2).flat_map(|y| (0..4).map(move |x| (y * 5 + x) * 4)).map(|i| [p.rgba[i], p.rgba[i + 1], p.rgba[i + 2]]).collect()
         };
 
+        // A shrunk glyph image is filtered whether or not it asks for interpolation, so some
+        // interior pixel blends two palette colours in both renders.
         let omitted = render("");
-        for px in interior(&omitted) {
-            assert!(palette.contains(&px), "non-interpolated glyph image was smoothed to {px:?}");
-        }
+        assert!(interior(&omitted).iter().any(|px| !palette.contains(px)), "a shrunk non-interpolated glyph image should be filtered");
         let enabled = render("/Interpolate true ");
         assert!(interior(&enabled).iter().any(|px| !palette.contains(px)), "/Interpolate true glyph image should still be sampled bicubically");
     }
