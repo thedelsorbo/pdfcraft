@@ -11,3 +11,7 @@ Synthetic one-page PDF (`scheda.pdf`, written by LibreOffice, DejaVu Sans TrueTy
   `cmp_edit_C_data.png`, `cmp_edit_D_glifo_mancante.png`.
 
 The text in the PDF is placeholder text; no real document is included.
+
+`scanned_card.pdf` is the same card rendered to a 288 dpi JPEG and wrapped as a one-image page
+(a "scan"), used in "Shrunk images without /Interpolate are nearest-sampled: scanned text comes
+out ragged": `scanned_card_61dpi_before_after.png`.
