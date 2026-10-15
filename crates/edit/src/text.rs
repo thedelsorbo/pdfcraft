@@ -1750,7 +1750,12 @@ pub(crate) fn rewrite_block_with_limit(
     let metrics = fonts_res.get(font_name.as_bytes()).and_then(|f| doc.resolve(f).as_dict().cloned()).map(|d| Metrics::from_dict(doc, &d));
     let visual_indic = metrics.as_ref().is_some_and(|m| m.visual_order) || first.visual_order;
     let indic_text = if visual_indic { crate::indic::to_visual(&text) } else { text.clone() };
-    let reuse = style.family.is_none() && style.bold.is_none() && metrics.as_ref().is_some_and(|m| source_encodes(m, &indic_text));
+    // An invisible layer's font is never reused for the visible text that replaces an OCR word:
+    // it was chosen to be searched, not seen (Tesseract's and OCRmyPDF's "GlyphLessFont" draws
+    // every character as a filled box), so a rewritten word came out as a row of boxes. The
+    // standard face matching the layer's style draws it instead, as the OCR layers PdfCraft
+    // writes itself (Helvetica) do.
+    let reuse = style.family.is_none() && style.bold.is_none() && !b.invisible && metrics.as_ref().is_some_and(|m| source_encodes(m, &indic_text));
     let space = metrics.as_ref().map_or(0.33, |m| source_space(doc, &fonts_res, m));
     // The chosen style also determines the real Japanese fallback outlines and advances.
     let (family, bold, italic) = style.family.unwrap_or((source_family(&b.base_font), b.bold, b.italic));

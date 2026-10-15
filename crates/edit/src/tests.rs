@@ -3443,3 +3443,43 @@ fn an_items_measured_face_is_the_face_it_is_written_as() {
     let courier = |italic| Family::Courier.width("Anna", 12.0, false, italic);
     assert_eq!(courier(false), courier(true));
 }
+
+/// A scanned page as OCR tools write it: the picture (here a plain rectangle) and an invisible
+/// text layer (`3 Tr`) whose font maps every character but is not meant to be seen (Tesseract's
+/// "GlyphLessFont" draws a filled box for each).
+fn ocr_page() -> Document {
+    let widths: Vec<&str> = (32..=122).map(|_| "500").collect();
+    let font = format!(
+        "<< /Type /Font /Subtype /TrueType /BaseFont /GlyphLessFont /FirstChar 32 /LastChar 122 /Widths [{}] /Encoding /WinAnsiEncoding >>",
+        widths.join(" ")
+    );
+    build(&[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        &stream("", "0.9 0.9 0.9 rg 0 0 600 800 re f BT 3 Tr /F1 12 Tf 40 700 Td (Online) Tj ET"),
+        &font,
+    ])
+}
+
+/// An OCR word rewritten as a paragraph is drawn visibly in a standard face, never in the
+/// invisible layer's own font: that font encodes every character (so it "can show" the text)
+/// but was chosen to be searched, not seen, and drew the new word as a row of boxes.
+#[test]
+fn a_rewritten_ocr_word_never_reuses_the_invisible_layers_font() {
+    let mut doc = ocr_page();
+    let blocks = text::text_blocks(&doc, 0).unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert!(blocks[0].invisible, "a 3 Tr line is an OCR word");
+    let style = text::BlockStyle { cover: Some([0.9, 0.9, 0.9]), color: Some([0.1, 0.4, 0.2]), ..Default::default() };
+    let result = text::rewrite_block(&mut doc, 0, 0, Some("In aula"), &style).unwrap();
+    assert_eq!(result.substituted.as_deref(), Some("Helvetica"), "the visible text takes a standard face");
+    let content = streams(&doc, 0).join("\n");
+    assert!(content.contains("0 Tr"), "the new word is drawn visibly:\n{content}");
+    assert!(content.contains("/PCEdHelv 12 Tf"), "the substitute Helvetica resource draws it:\n{content}");
+    assert!(!content.contains("/F1 12 Tf\n0 Tc"), "the layer's font must not draw visible text:\n{content}");
+    // The reopened page still reads the new word, and the layer's font survives for the rest.
+    let again = reopen(&doc);
+    let lines = text::text_lines(&again, 0).unwrap();
+    assert!(lines.iter().any(|l| l.text == "In aula"), "{:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+}

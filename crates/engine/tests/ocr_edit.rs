@@ -207,3 +207,24 @@ fn visible_stretched_text_rewrites_unchanged() {
     let i = ((y * out.width + x) * 4) as usize;
     assert_eq!(&out.rgba[i..i + 3], &[255, 255, 255]);
 }
+
+/// Edit text's line path on an OCR word: rewriting the invisible layer alone changed what is
+/// searched and showed nothing, which read as "the edit was not saved". It is now the paragraph
+/// edit of the word's block, so the scan is covered and the new text shows.
+#[test]
+fn editing_an_ocr_word_by_line_shows_the_new_text_too() {
+    let (mut s, id) = scanned();
+    let lines = s.get(id).unwrap().text_lines(0);
+    assert_eq!(lines.len(), 1);
+
+    s.apply(id, Edit::EditTextLine { page: 0, line: 0, text: "Jane".into() }).unwrap();
+
+    let blocks = s.get(id).unwrap().text_blocks(0);
+    assert_eq!(blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>(), ["Jane"]);
+    assert!(!blocks[0].invisible, "the new text is drawn, not hidden in the OCR layer");
+    let px = word_pixels(&s, id);
+    let paper = px.iter().filter(|p| near(**p, PAPER)).count();
+    let ink = px.iter().filter(|p| near(**p, INK)).count();
+    assert!(paper * 10 > px.len() * 4, "mostly paper now: {paper} of {}", px.len());
+    assert!(ink * 100 > px.len() * 3, "the new text shows in the scan's ink colour: {ink} of {}", px.len());
+}

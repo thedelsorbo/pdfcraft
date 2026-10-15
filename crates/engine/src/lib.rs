@@ -3308,6 +3308,22 @@ impl Session {
         if let Some(p) = editor.cos.permissions() {
             check_permission(&edit, &p)?;
         }
+        // A line edit of an OCR word (invisible text over a scan) is the paragraph edit of the
+        // block holding that line: rewriting the invisible layer alone changes what is searched
+        // but shows nothing, which reads as "the edit was not saved".
+        let edit = match edit {
+            Edit::EditTextLine { page, line, text } => {
+                let block = editor
+                    .text_blocks(page)
+                    .ok()
+                    .and_then(|blocks| blocks.iter().position(|b| b.invisible && b.lines.contains(&line)));
+                match block {
+                    Some(block) => Edit::EditTextBlock { page, block, text, style: pdfcraft_edit::BlockStyle::default() },
+                    None => Edit::EditTextLine { page, line, text },
+                }
+            }
+            other => other,
+        };
         // Rewriting an OCR word (invisible text over a scan) also hides the scanned word: cover it
         // in the paper's colour and draw the new text in the ink's.
         let edit = match edit {
