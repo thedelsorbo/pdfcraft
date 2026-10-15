@@ -1,0 +1,53 @@
+name: Windows portable build (prototype branch)
+
+# Builds pdfcraft.exe + pdfcraft-cli.exe for Windows x64 from this branch and publishes them as a
+# workflow artifact (a portable folder: no installer, no VC++ redistributable, settings kept
+# beside the exe). Mirrors the build step of packaging/windows/package.ps1 without the MSI,
+# signing, OCR models and craft-fonts (so OCR and the Japanese/Arabic faces are not included).
+
+on:
+  push:
+    branches: [hinted-sfnt-glyph-runs]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (windows-latest, x64)
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # Static CRT, as package.ps1 does: scoped to the target so host build scripts keep the default.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked -p pdfcraft -p pdfcraft-cli --target x86_64-pc-windows-msvc
+
+      - name: Assemble the portable folder
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $out = "pdfcraft-$version-windows-x64-portable-prototype"
+          New-Item -ItemType Directory -Path $out | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\pdfcraft.exe $out
+          Copy-Item target\x86_64-pc-windows-msvc\release\pdfcraft-cli.exe $out
+          Copy-Item packaging\windows\portable.txt $out
+          Copy-Item LICENSE-MIT, LICENSE-APACHE, NOTICE $out
+          "Prototype build of branch hinted-sfnt-glyph-runs (hinted sfnt glyph runs, see issue #730). Unsigned; no OCR models, no craft-fonts." | Set-Content (Join-Path $out 'PROTOTYPE.txt')
+          "ARTIFACT_DIR=$out" | Add-Content $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdfcraft-windows-x64-portable-prototype
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: error
