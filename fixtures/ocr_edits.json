@@ -1,0 +1,7 @@
+[{"tool":"doc_open","args":{"path":"ocr_card.pdf"}},
+ {"tool":"text_edit","args":{"doc":1,"page":1,"line":16,"text":"In aula"}},
+ {"tool":"doc_save","args":{"doc":1,"path":"ocr_card_edit_line.pdf"}},
+ {"tool":"doc_close","args":{"doc":1}},
+ {"tool":"doc_open","args":{"path":"ocr_card.pdf"}},
+ {"tool":"text_edit","args":{"doc":2,"page":1,"paragraph":16,"text":"In aula"}},
+ {"tool":"doc_save","args":{"doc":2,"path":"ocr_card_edit_par.pdf"}}]
