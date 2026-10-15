@@ -76,9 +76,12 @@ default-features = false
 
 [dependencies.vello_cpu]
 version = "0.0.8"
+# PdfCraft patch: `text` brings glifo's glyph runs (vertical hinting, baseline snapping,
+# glyph outline cache) used for sfnt glyphs in `Renderer::fill_hinted_glyph`.
 features = [
     "std",
     "png",
+    "text",
     "u8_pipeline",
 ]
 default-features = false

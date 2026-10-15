@@ -18,7 +18,7 @@ use std::sync::Arc;
 use vello_cpu::color::DynamicColor;
 use vello_cpu::color::palette::css::BLACK;
 use vello_cpu::color::{AlphaColor, PremulRgba8, Srgb};
-use vello_cpu::peniko::{ColorStop, Compose, Fill, Gradient, ImageQuality, ImageSampler, Mix};
+use vello_cpu::peniko::{Blob, ColorStop, Compose, Fill, FontData, Gradient, ImageQuality, ImageSampler, Mix};
 use vello_cpu::{
     Image, ImageSource, Mask, PaintType, Pixmap, RenderContext, RenderSettings, peniko,
 };
@@ -445,6 +445,14 @@ pub(crate) struct Renderer {
     pub(crate) preview: bool,
     // TODO: Remove this once vello_cpu bug with non-transparent images is fixed
     image_transparency_stack: Vec<bool>,
+    /// PdfCraft patch: vello_cpu resources (glyph preparation cache: hinting instances
+    /// and hinted outlines) kept for the renderer's lifetime, so a page's glyphs are
+    /// hinted once per size rather than once per occurrence.
+    pub(crate) resources: vello_cpu::Resources,
+    /// PdfCraft patch: the vello_cpu font handle for each font program drawn through a
+    /// glyph run, by the program's cache key. A handle's identity keys the glyph
+    /// preparation cache, so one handle per program is what makes that cache hit.
+    pub(crate) run_fonts: HashMap<u128, FontData>,
 }
 
 #[derive(Clone, Copy)]
@@ -474,6 +482,8 @@ impl Renderer {
             scaler: Scaler::new(ResamplingFunction::CatmullRom),
             preview,
             image_transparency_stack: Vec::new(),
+            resources: vello_cpu::Resources::default(),
+            run_fonts: HashMap::default(),
         }
     }
 
@@ -581,6 +591,8 @@ impl Renderer {
                 scaler: self.scaler,
                 preview: self.preview,
                 image_transparency_stack: Vec::new(),
+                resources: vello_cpu::Resources::default(),
+                run_fonts: HashMap::default(),
             };
             let mut mask_pix = Pixmap::new(self.ctx.width(), self.ctx.height());
             let rgb_data = ImageData::Rgb(RgbData {
@@ -596,8 +608,7 @@ impl Renderer {
             // values between alpha_data and rgb_data don't match, which they do here.
             renderer.draw_image(rgb_data, Some(alpha_data));
             renderer.ctx.flush();
-            let mut resources = vello_cpu::Resources::default();
-            renderer.ctx.render_to_pixmap(&mut resources, &mut mask_pix);
+            renderer.ctx.render_to_pixmap(&mut renderer.resources, &mut mask_pix);
             Mask::new_alpha(&mask_pix)
         };
 
@@ -1157,14 +1168,15 @@ impl Renderer {
                             scaler: self.scaler,
                             preview: self.preview,
                             image_transparency_stack: Vec::new(),
+                            resources: vello_cpu::Resources::default(),
+                            run_fonts: HashMap::default(),
                         };
                         let mut initial_transform = Affine::scale_non_uniform(xs as f64, ys as f64)
                             * Affine::translate((-bbox.x0, -bbox.y0));
                         t.interpret(&mut renderer, initial_transform, is_stroke);
                         let mut pix = Pixmap::new(pix_width, pix_height);
                         renderer.ctx.flush();
-                        let mut resources = vello_cpu::Resources::default();
-                        renderer.ctx.render_to_pixmap(&mut resources, &mut pix);
+                        renderer.ctx.render_to_pixmap(&mut renderer.resources, &mut pix);
 
                         // TODO: Fix these
                         if x_step < 0.0 {
@@ -1269,6 +1281,12 @@ impl Renderer {
     ) {
         match glyph {
             Glyph::Outline(o) => {
+                // PdfCraft patch: sfnt glyphs filled with a solid colour go through a glyph
+                // run (hinted at the device size, baseline on a whole pixel). Everything
+                // else keeps the generic outline fill below.
+                if self.fill_hinted_glyph(o, transform, glyph_transform, paint) {
+                    return;
+                }
                 let base_outline = self.cached_outline(o);
 
                 self.fill_path(
@@ -1327,6 +1345,64 @@ impl Renderer {
         let path = Rc::new(glyph.outline());
         self.outline_cache.borrow_mut().insert(id, path.clone());
         path
+    }
+
+    /// PdfCraft patch: fill one sfnt glyph through a vello_cpu glyph run instead of a generic
+    /// path fill. The run hints the outline at the device size (vertical grid fitting through
+    /// skrifa, as text engines do) and lands the baseline on a whole device pixel while keeping
+    /// sub-pixel positioning along the line, so body text at 96 dpi has crisp stems and every
+    /// line of a paragraph looks alike (#730). Only text that can be hinted is routed here: an
+    /// embedded or substituted TrueType/OpenType program (bare CFF and Type 1 programs have no
+    /// `head` table for the run to size by) painted with a solid colour (patterns need the clip
+    /// and bbox handling of `fill_path`). Rotated or skewed text is drawn by the run unhinted,
+    /// which is the same geometry as the path fill. Returns `false` when the generic fill
+    /// should draw the glyph.
+    fn fill_hinted_glyph(
+        &mut self,
+        glyph: &hayro_interpret::font::OutlineGlyph,
+        transform: Affine,
+        glyph_transform: Affine,
+        paint: &Paint<'_>,
+    ) -> bool {
+        if !matches!(paint, Paint::Color(_)) {
+            return false;
+        }
+        let Some(font) = glyph.font_data() else {
+            return false;
+        };
+        let bytes: &[u8] = (*font.data).as_ref();
+        // A single-face sfnt: TrueType (0x00010000 or `true`) or OpenType (`OTTO`). A `ttcf`
+        // collection would need its face index, which the glyph does not carry.
+        if !(bytes.starts_with(&[0, 1, 0, 0]) || bytes.starts_with(b"true") || bytes.starts_with(b"OTTO")) {
+            return false;
+        }
+        let full = transform * glyph_transform;
+        let [a, b, c, d, _, _] = full.as_coeffs();
+        if ![a, b, c, d].iter().all(|v| v.is_finite()) || (a == 0.0 && b == 0.0) || (c == 0.0 && d == 0.0) {
+            return false;
+        }
+        // `outline()` is drawn at an em of 1000 units with y up; the run draws the font at
+        // `font_size` pixels per em with y down. The flip makes the run's transform a
+        // positive scale for upright text, which is what the run hints.
+        let font_size = 1000.0;
+        let flip = Affine::scale_non_uniform(1.0, -1.0);
+        let peniko_font = self
+            .run_fonts
+            .entry(font.cache_key)
+            .or_insert_with(|| FontData::new(Blob::new(font.data.clone()), 0))
+            .clone();
+        let paint = self.replaced(paint, true);
+        self.ctx.set_fill_rule(Fill::NonZero);
+        self.ctx.set_transform(transform);
+        let empty = BezPath::new();
+        let _ = self.set_paint(&paint, &empty, false);
+        self.ctx
+            .glyph_run(&mut self.resources, &peniko_font)
+            .font_size(font_size)
+            .glyph_transform(glyph_transform * flip)
+            .hint(true)
+            .fill_glyphs(std::iter::once(vello_cpu::Glyph { id: glyph.glyph_id().to_u32(), x: 0.0, y: 0.0 }));
+        true
     }
 
     fn force_images_may_have_transparency(&self) -> bool {
@@ -1472,15 +1548,16 @@ impl<'a> Device<'a> for Renderer {
                                         scaler: self.scaler,
                                         preview: self.preview,
                                         image_transparency_stack: Vec::new(),
+                                        resources: vello_cpu::Resources::default(),
+                                        run_fonts: HashMap::default(),
                                     };
                                     let mut sub_pix = Pixmap::new(width, height);
                                     sub_renderer.ctx.set_transform(transform);
                                     sub_renderer.draw_image(rgb_bytes, Some(stencil));
                                     sub_renderer.ctx.flush();
-                                    let mut resources = vello_cpu::Resources::default();
                                     sub_renderer
                                         .ctx
-                                        .render_to_pixmap(&mut resources, &mut sub_pix);
+                                        .render_to_pixmap(&mut sub_renderer.resources, &mut sub_pix);
                                     sub_pix
                                 };
 
@@ -1757,6 +1834,8 @@ fn draw_soft_mask(mask: &SoftMask<'_>, settings: RenderSettings, width: u16, hei
         scaler: Scaler::new(ResamplingFunction::CatmullRom),
         preview,
         image_transparency_stack: Vec::new(),
+        resources: vello_cpu::Resources::default(),
+        run_fonts: HashMap::default(),
     };
 
     let bg_color = mask.background_color().to_rgba();
@@ -1780,8 +1859,7 @@ fn draw_soft_mask(mask: &SoftMask<'_>, settings: RenderSettings, width: u16, hei
 
     let mut pix = Pixmap::new(width, height);
     renderer.ctx.flush();
-    let mut resources = vello_cpu::Resources::default();
-    renderer.ctx.render_to_pixmap(&mut resources, &mut pix);
+    renderer.ctx.render_to_pixmap(&mut renderer.resources, &mut pix);
 
     let mut rendered_mask = match mask.mask_type() {
         MaskType::Luminosity => Mask::new_luminance(&pix),

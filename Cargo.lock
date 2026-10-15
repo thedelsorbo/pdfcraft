@@ -2278,9 +2278,9 @@ dependencies = [
 
 [[package]]
 name = "glifo"
-version = "0.1.1"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d99fc21d493812643aae86d53b7bbd02f376434a90317e8a790bc209fdd6605e"
+checksum = "ae9d48c6d81526ad2f9d5d6e5fddf5f6949ffbc46fcac0db0d061a6e65097019"
 dependencies = [
  "bytemuck",
  "foldhash",
@@ -2290,7 +2290,7 @@ dependencies = [
  "png 0.18.1",
  "skrifa 0.42.1",
  "smallvec",
- "vello_common 0.0.9",
+ "vello_common 0.0.8",
 ]
 
 [[package]]
@@ -6897,23 +6897,6 @@ dependencies = [
 
 [[package]]
 name = "vello_common"
-version = "0.0.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19d672facaa2d697285a786cd9d44d614cd2ce54cdc022504bf339f8fff3b750"
-dependencies = [
- "bytemuck",
- "fearless_simd",
- "guillotiere",
- "hashbrown 0.17.1",
- "log",
- "peniko",
- "png 0.18.1",
- "smallvec",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "vello_common"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2e9aed918117e8152c9eddfd8362d73c465c23f26c44786aa331707b8a64fa2"
@@ -6934,7 +6917,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d8ded630e8316bb94a55881256506d1f3b9947b5f66db8a7d32ca7ba02decd0"
 dependencies = [
  "bytemuck",
- "glifo 0.1.1",
+ "glifo 0.1.0",
  "hashbrown 0.17.1",
  "png 0.18.1",
  "vello_common 0.0.8",
